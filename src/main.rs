@@ -8,7 +8,7 @@ use fastping_rs::PingResult::{Idle, Receive};
 use http_get::HttpGetter;
 use ping::SingleHost;
 use public_ip;
-use serenity::model::prelude::PrivateChannel;
+use serenity::model::prelude::{PrivateChannel, Activity};
 use serenity::model::user::User;
 use serenity::{
     async_trait,
@@ -34,17 +34,24 @@ struct Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn ready(&self, _: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         println!("{} is connected!\n\n", ready.user.name);
+        
+        ctx.set_activity(Activity::watching(HOST)).await;
     }
 
-    async fn message(&self, _: Context, message: Message) {
-        if !message.author.bot {
-            println!("got message from {} - subscribing", message.author.name);
-        }
+    async fn message(&self, ctx: Context, message: Message) {
+        if !message.author.bot && message.content.starts_with("!subscribe") {
+            match message.reply(&ctx.http, "Got it! Check you DMs!").await {
+                Ok(_) => (),
+                Err(err) => println!("could not reply to message from {}: {}", message.author, err)
+            };
 
-        if let Err(err) = self.tx.send(message.author) {
-            println!("Error getting message author: {}", err);
+            println!("got message from {} - subscribing", message.author.name);
+
+            if let Err(err) = self.tx.send(message.author) {
+                println!("Error getting message author: {}", err);
+            }
         }
     }
 }
@@ -69,7 +76,7 @@ async fn main() {
 
     let token = env::var("DISCORD_TOKEN")
         .expect("Expected discord token to be in the `DISCORD_TOKEN` enviornment variable");
-    let intents = GatewayIntents::DIRECT_MESSAGES | GatewayIntents::GUILD_MESSAGES;
+    let intents = GatewayIntents::DIRECT_MESSAGES | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
     let framework = StandardFramework::new();
     let (tx, rx) = mpsc::sync_channel(0);
     let mut client = Client::builder(&token, intents)
@@ -97,9 +104,7 @@ async fn main() {
             msg = "the fog appears to be functioning normaly again! :D".to_string();
         } 
         
-        if !is_same_err(&msg, &prev_msg) {
-            prev_msg = msg.clone();
-
+        if !is_same_err(&msg, &prev_msg) && !msg.is_empty() {
             for channel in user_dms.iter() {
                 if let Err(err) = channel.say(&http, msg.clone()).await {
                     println!(
@@ -110,10 +115,13 @@ async fn main() {
             }
         }
 
-        msg.insert(msg.len(), '\n');
-        println!("{}", msg.clone());
-        msg = String::new();
+        if !msg.is_empty() {
+            println!("{}\n", msg.clone());
+        }
 
+        prev_msg = msg.clone();
+        msg = String::new();
+        
         let single_host = match SingleHost::new(HOST) {
             Ok(h) => h,
             Err(err) => {
@@ -165,9 +173,9 @@ async fn main() {
                     if let Some(public_ip) = public_ip::addr().await {
                         if public_ip != addr {
                             msg.insert_str(
-                                    msg.len(),
-                                    format!("the fog's address does not match DNS!: (pinged: `{}`, expected: `{}`)\n", addr, public_ip).as_str(),
-                                );
+                                msg.len(),
+                                format!("the fog's address does not match DNS!: (pinged: `{}`, expected: `{}`)\n", addr, public_ip).as_str(),
+                            );
                         }
                     }
                 }
