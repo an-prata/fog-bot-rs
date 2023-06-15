@@ -1,47 +1,66 @@
 // Copyright (c) 2023 Evan Overman (https://an-prata.it). Licensed under the MIT License.
 // See LICENSE file in repository root for complete license text.
 
-use curl::easy::Easy;
-use dns_lookup;
+mod http_get;
+mod ping;
+
 use fastping_rs::PingResult::{Idle, Receive};
-use fastping_rs::Pinger;
+use http_get::HttpGetter;
+use ping::SingleHost;
 use public_ip;
 use serenity::model::prelude::PrivateChannel;
+use serenity::model::user::User;
 use serenity::{
     async_trait,
     framework::StandardFramework,
     http::Http,
-    model::prelude::{Message, Ready, UserId},
+    model::prelude::{Message, Ready},
     prelude::{Context, EventHandler, GatewayIntents},
     Client,
 };
 use std::{
     env,
-    net::IpAddr,
     sync::mpsc::{self, SyncSender},
     time::Duration,
 };
 use tokio::{task, time::sleep};
 
+const URL: &str = "https://an-prata.it/";
+const HOST: &str = "an-prata.it";
+
 struct Handler {
-    tx: SyncSender<UserId>,
+    tx: SyncSender<User>,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, _: Context, ready: Ready) {
-        println!("{} is connected!", ready.user.name);
+        println!("{} is connected!\n\n", ready.user.name);
     }
 
     async fn message(&self, _: Context, message: Message) {
-        if let Err(err) = self.tx.send(message.author.id) {
-            println!("Error getting message author's id: {}", err);
-        }
-
         if !message.author.bot {
             println!("got message from {} - subscribing", message.author.name);
         }
+
+        if let Err(err) = self.tx.send(message.author) {
+            println!("Error getting message author: {}", err);
+        }
     }
+}
+
+fn is_same_err(a: &String, b: &String) -> bool {
+    for (a, b) in a.chars().zip(b.chars()) {
+        if a != b {
+            return false;
+        }
+
+        if a == ':' {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[tokio::main]
@@ -59,15 +78,10 @@ async fn main() {
         .await
         .expect("Error instantiating client");
 
-    let mut user_ids: Vec<UserId> = Vec::new();
     let mut user_dms: Vec<PrivateChannel> = Vec::new();
-    let mut curl = Easy::new();
-    let http = Http::new(&token);
 
-    curl.url("https://an-prata.it/")
-        .expect("expected to be able to set url on curl");
-    curl.write_function(|data| Ok(data.len()))
-        .expect("expected to be able to set write function on curl");
+    let mut web_getter = HttpGetter::new(URL).expect("expected to be able to setup curl");
+    let http = Http::new(&token);
 
     task::spawn(async move {
         if let Err(err) = client.start().await {
@@ -75,141 +89,112 @@ async fn main() {
         }
     });
 
+    let mut msg = String::new();
+    let mut prev_msg = String::new();
+
     loop {
-        let ips: Vec<IpAddr> = match dns_lookup::lookup_host("an-prata.it") {
-            Ok(ips) => ips,
+        if msg.is_empty() && !prev_msg.is_empty(){
+            msg = "the fog appears to be functioning normaly again! :D".to_string();
+        } 
+        
+        if !is_same_err(&msg, &prev_msg) {
+            prev_msg = msg.clone();
+
+            for channel in user_dms.iter() {
+                if let Err(err) = channel.say(&http, msg.clone()).await {
+                    println!(
+                        "failed to send direct message to {}: {}",
+                        channel.recipient, err
+                    );
+                }
+            }
+        }
+
+        msg.insert(msg.len(), '\n');
+        println!("{}", msg.clone());
+        msg = String::new();
+
+        let single_host = match SingleHost::new(HOST) {
+            Ok(h) => h,
             Err(err) => {
-                println!("failed to resolve hostname: {}", err);
+                msg.insert_str(
+                    msg.len(),
+                    format!("could not resolve hostname ({}): {}\n", HOST, err).as_str(),
+                );
                 continue;
             }
         };
 
-        let (pinger, results) = match Pinger::new(None, None) {
-            Ok(pair) => pair,
-            Err(err) => {
-                println!("failed to create pinger with error: {}", err);
-                continue;
-            }
-        };
+        single_host.ping();
 
-        for ip in ips {
-            pinger.add_ipaddr(ip.to_string().as_str());
-        }
-
-        pinger.ping_once();
-
-        while let Ok(id) = rx.try_recv() {
-            if user_ids.iter().all(|i| *i != id) {
-                user_ids.push(id);
-            }
-        }
-
-        for id in user_ids.clone().iter() {
-            let channel = match id.create_dm_channel(&http).await {
-                Ok(c) => {
-                    println!("open new direct message");
-                    user_dms.push(c.clone());
-
-                    if let Err(err) = c.say(&http, "opening dms with you!").await {
-                        println!("could not open deirect message channel: {}", err);
-                    }
-
-                    c
-                }
-                Err(err) => {
-                    println!("could not open direct message channel: {}", err);
-                    continue;
-                }
-            };
-
-            match results.recv() {
-                Ok(res) => match res {
-                    Idle { addr } => {
-                        println!("the fog idle at address: {}", addr);
-
+        while let Ok(user) = rx.try_recv() {
+            if !user_dms.iter().any(|c| c.recipient == user) {
+                match user.create_dm_channel(&http).await {
+                    Ok(channel) => {
                         if let Err(err) = channel
-                            .say(&http, format!("the fog idle at address: {}", addr))
-                            .await
+                            .say(
+                                &http, 
+                                format!("Hello {}! I'll be opening DMs with you to notify you of server events!\n", user)
+                            )
+                            .await 
                         {
-                            println!("failed to send direct message with error: {}", err);
+                            println!("failed to send direct to {} message with error: {}", user, err);
                         }
-                    }
-                    Receive { addr, rtt } => {
-                        println!("received from address {} in {:?}", addr, rtt);
 
-                        if let Some(public_ip) = public_ip::addr().await {
-                            if public_ip != addr {
-                                println!(
-                                    "adresses to dont match! (pinged: {}, expected: {})",
-                                    addr, public_ip
+                        user_dms.push(channel)
+                    }
+                    Err(_) => {
+                        println!("failed to open direct message channel with {}", user);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        match single_host.results() {
+            Ok(res) => match res {
+                Idle { addr } => {
+                    msg.insert_str(
+                        msg.len(),
+                        format!("the fog idle at address: {}\n", addr).as_str(),
+                    );
+                }
+                Receive { addr, rtt } => {
+                    println!("received from address {} in {:?}", addr, rtt);
+
+                    if let Some(public_ip) = public_ip::addr().await {
+                        if public_ip != addr {
+                            msg.insert_str(
+                                    msg.len(),
+                                    format!("the fog's address does not match DNS!: (pinged: `{}`, expected: `{}`)\n", addr, public_ip).as_str(),
                                 );
-
-                                if let Err(err) = channel
-                                    .say(&http, format!("the fog's address does not match DNS!: (pinged: `{}`, expected: `{}`)", addr, public_ip))
-                                    .await
-                                {
-                                    println!(
-                                        "failed to send direct message with error: {}",
-                                        err
-                                    );
-                                }
-                            }
                         }
                     }
-                },
-                Err(err) => {
-                    println!("error pinging: {}", err);
-
-                    if let Err(err) = channel
-                        .say(&http, format!("failed to ping the fog: {}", err))
-                        .await
-                    {
-                        println!("failed to send direct message with error: {}", err);
-                    }
                 }
+            },
+            Err(err) => {
+                msg.insert_str(
+                    msg.len(),
+                    format!("failed to ping the fog: {}\n", err).as_str(),
+                );
             }
+        }
 
-            match curl.perform() {
-                Ok(_) => (),
-                Err(err) => {
-                    println!("failed to perform http request: {}", err);
-
-                    if let Err(err) = channel
-                        .say(&http, format!("failed to perform http request: `{}`", err))
-                        .await
-                    {
-                        println!("failed to send direct message with error: {}", err);
-                    }
-                }
+        match web_getter.run() {
+            Ok(c) if c != 200 => {
+                msg.insert_str(
+                    msg.len(),
+                    format!("bad responce over http: `{}`\n", c).as_str(),
+                );
             }
-
-            match curl.response_code() {
-                Ok(c) if c != 200 => {
-                    println!("bad response over http: {}", c);
-
-                    if let Err(err) = channel
-                        .say(&http, format!("bad request over http: `{}`", c))
-                        .await
-                    {
-                        println!("failed to send direct message with error: {}", err);
-                    }
-                }
-                Ok(c) => {
-                    println!("good response over http: {}", c);
-                }
-                Err(err) => {
-                    println!("failed to get response code over http: {}", err);
-
-                    if let Err(err) = channel
-                        .say(
-                            &http,
-                            format!("failed to get response over http: `{}`", err),
-                        )
-                        .await
-                    {
-                        println!("failed to send direct message with error: {}", err);
-                    }
-                }
+            Ok(c) => {
+                println!("good response over http: {}", c);
+            }
+            Err(err) => {
+                msg.insert_str(
+                    msg.len(),
+                    format!("failed to perform http request: `{}`\n", err).as_str(),
+                );
             }
         }
 
