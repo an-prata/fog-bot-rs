@@ -206,6 +206,6 @@ async fn main() {
             }
         }
 
-        sleep(Duration::from_secs(10)).await;
+        sleep(Duration::from_secs(60)).await;
     }
 }
